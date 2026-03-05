@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from django.conf import settings
 
-from .models import GoogleAdsKeywordIdea
+from .models import GoogleAdsConnection, GoogleAdsKeywordIdea
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,11 +22,10 @@ class KeywordIdea:
     high_top_of_page_bid_micros: int | None
 
 
-def _has_ads_credentials() -> bool:
+def _has_app_ads_credentials() -> bool:
+    """App-level credentials (developer token, OAuth client). Refresh token comes from user auth."""
     required = [
         "GOOGLE_ADS_DEVELOPER_TOKEN",
-        "GOOGLE_ADS_CUSTOMER_ID",
-        "GOOGLE_ADS_REFRESH_TOKEN",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
     ]
@@ -81,6 +83,15 @@ def fetch_keyword_ideas_for_user(
     """
     from google.ads.googleads.client import GoogleAdsClient  # type: ignore[import]
 
+    keywords_list = list(keywords)
+    logger.info(
+        "[Google Ads] fetch_keyword_ideas_for_user: user_id=%s, keywords_count=%s, industry=%s, description_len=%s",
+        user_id,
+        len(keywords_list),
+        industry or "(none)",
+        len(description) if description else 0,
+    )
+
     now = datetime.now(timezone.utc)
 
     # First, load cached ideas.
@@ -99,7 +110,12 @@ def fetch_keyword_ideas_for_user(
             high_top_of_page_bid_micros=idea.high_top_of_page_bid_micros,
         )
 
-    remaining = [k for k in keywords if k not in cached]
+    remaining = [k for k in keywords_list if k not in cached]
+    logger.info(
+        "[Google Ads] Cached ideas loaded: %s; remaining keywords to fetch: %s",
+        len(cached),
+        len(remaining),
+    )
 
     # Use business profile context (industry / description) as additional seeds
     # to help Google Ads suggest better ideas, without changing intent logic.
@@ -114,31 +130,72 @@ def fetch_keyword_ideas_for_user(
         if snippet:
             extra_seeds.append(snippet)
 
-    if (not remaining and not extra_seeds) or not _has_ads_credentials():
+    has_app_creds = _has_app_ads_credentials()
+    logger.info(
+        "[Google Ads] App credentials present: %s; remaining=%s, extra_seeds=%s",
+        has_app_creds,
+        len(remaining),
+        extra_seeds,
+    )
+
+    if (not remaining and not extra_seeds) or not has_app_creds:
+        logger.info(
+            "[Google Ads] Early return (no seeds or no app creds). Returning %s cached.",
+            len(cached),
+        )
         return cached
 
-    # Always use the company's global Google Ads credentials, not per-user tokens.
-    refresh_token = getattr(settings, "GOOGLE_ADS_REFRESH_TOKEN", None)
-    customer_id = getattr(settings, "GOOGLE_ADS_CUSTOMER_ID", "")
+    # Use the user's Google Ads connection (refresh_token + customer_id from OAuth at login).
+    # Do not use env for refresh token — it comes from user auth only.
+    try:
+        conn = GoogleAdsConnection.objects.get(user_id=user_id)
+        logger.info(
+            "[Google Ads] User connection found: user_id=%s, has_refresh_token=%s, customer_id=%s",
+            user_id,
+            bool((conn.refresh_token or "").strip()),
+            (conn.customer_id or "").strip() or "(empty)",
+        )
+    except GoogleAdsConnection.DoesNotExist:
+        logger.warning("[Google Ads] No GoogleAdsConnection for user_id=%s. Returning cached only.", user_id)
+        return cached
+    refresh_token = (conn.refresh_token or "").strip()
+    customer_id = (conn.customer_id or "").strip()
+    if not customer_id:
+        customer_id = (getattr(settings, "GOOGLE_ADS_CUSTOMER_ID", None) or "").strip()
+        if customer_id:
+            logger.info("[Google Ads] Using GOOGLE_ADS_CUSTOMER_ID from settings (user connection had no customer_id).")
     if not refresh_token or not customer_id:
+        logger.warning(
+            "[Google Ads] User connection missing refresh_token or customer_id (refresh_token=%s, customer_id=%s). Returning cached.",
+            "present" if refresh_token else "missing",
+            customer_id or "missing",
+        )
         return cached
 
-    # Build Google Ads client from company-level settings.
-    # Note: login_customer_id can match customer_id since we only use a single Ads account.
+    # Build Google Ads client using user's tokens and app-level developer token + OAuth client.
     config = {
         "developer_token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
-        "login_customer_id": customer_id,
-        "client_customer_id": customer_id,
+        "login_customer_id": customer_id.replace("-", ""),
+        "client_customer_id": customer_id.replace("-", ""),
         "use_proto_plus": True,
         "refresh_token": refresh_token,
         "client_id": settings.GOOGLE_CLIENT_ID,
         "client_secret": settings.GOOGLE_CLIENT_SECRET,
     }
+    customer_id_clean = customer_id.replace("-", "")
+    request_seeds = remaining + extra_seeds
+    logger.info(
+        "[Google Ads] Calling KeywordPlanIdeaService: customer_id=%s, seed_count=%s, seeds=%s",
+        customer_id_clean,
+        len(request_seeds),
+        request_seeds[:10] if len(request_seeds) > 10 else request_seeds,
+    )
+
     client = GoogleAdsClient.load_from_dict(config)
     service = client.get_service("KeywordPlanIdeaService")
 
     request = client.get_type("GenerateKeywordIdeasRequest")
-    request.customer_id = customer_id.replace("-", "")
+    request.customer_id = customer_id_clean
     request.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH_AND_PARTNERS
     # Always include the remaining keywords; optionally add extra business-context seeds.
     if remaining:
@@ -148,13 +205,22 @@ def fetch_keyword_ideas_for_user(
 
     try:
         response = service.generate_keyword_ideas(request=request)
-    except Exception:
-        # On any error, just return cached data and avoid breaking the flow.
+        response_list = list(response)
+        logger.info("[Google Ads] API returned %s keyword ideas.", len(response_list))
+    except Exception as e:
+        logger.exception(
+            "[Google Ads] KeywordPlanIdeaService.generate_keyword_ideas failed: %s. Returning cached.",
+            e,
+        )
         return cached
 
-    for idea in response:
+    added = 0
+    # When remaining is empty we're in "recommendation only" mode (seeds from
+    # industry/description): accept all ideas from the API. Otherwise only
+    # keep ideas that match the requested seed keywords.
+    for idea in response_list:
         text = idea.text
-        if text not in remaining:
+        if remaining and text not in remaining:
             continue
 
         metrics = idea.keyword_idea_metrics
@@ -197,6 +263,13 @@ def fetch_keyword_ideas_for_user(
             low_top_of_page_bid_micros=low_bid,
             high_top_of_page_bid_micros=high_bid,
         )
+        added += 1
 
+    logger.info(
+        "[Google Ads] fetch_keyword_ideas_for_user done: user_id=%s, ideas_added_from_api=%s, total_cached=%s.",
+        user_id,
+        added,
+        len(cached),
+    )
     return cached
 

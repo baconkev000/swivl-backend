@@ -342,3 +342,5 @@ LOGIN_REDIRECT_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "123")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/accounts/google/login/callback/")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "123")
+GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "123")
+GOOGLE_ADS_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "123")

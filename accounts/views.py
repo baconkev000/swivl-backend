@@ -1,3 +1,4 @@
+import logging
 import secrets
 from urllib.parse import urlencode, unquote, quote
 from datetime import datetime, date, timedelta, timezone
@@ -16,7 +17,9 @@ from rest_framework.response import Response
 from .models import (
     BusinessProfile,
     GoogleSearchConsoleConnection,
+    GoogleBusinessProfileConnection,
     SEOOverviewSnapshot,
+    ReviewsOverviewSnapshot,
     AgentConversation,
     AgentMessage,
 )
@@ -24,7 +27,7 @@ from .serializers import BusinessProfileSerializer
 from .google_ads_client import classify_intent, fetch_keyword_ideas_for_user
 from . import openai_utils
 
-
+logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
@@ -275,6 +278,109 @@ def gsc_connect_callback(request: HttpRequest) -> HttpResponse:
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
+def gbp_status(request: HttpRequest) -> Response:
+    """
+    Return whether the current user has a Google Business Profile connection.
+    """
+    connected = GoogleBusinessProfileConnection.objects.filter(
+        user=request.user,
+    ).exclude(refresh_token="").exists()
+    return Response({"connected": bool(connected)})
+
+
+def gbp_connect_start(request: HttpRequest) -> HttpResponse:
+    """
+    Start Google OAuth flow for Google Business Profile (reviews, locations).
+    """
+    if not request.user.is_authenticated:
+        return redirect(settings.FRONTEND_BASE_URL + "/login")
+
+    state = secrets.token_urlsafe(32)
+    request.session["gbp_state"] = state
+    next_url = request.GET.get("next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+    request.session["gbp_next"] = next_url
+
+    redirect_uri = request.build_absolute_uri("/integrations/google-business-profile/callback/")
+    scope = "https://www.googleapis.com/auth/business.manage"
+
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scope,
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "state": state,
+        "prompt": "consent",
+    }
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return redirect(auth_url)
+
+
+def gbp_connect_callback(request: HttpRequest) -> HttpResponse:
+    """
+    Handle the Google OAuth callback for Google Business Profile and persist tokens.
+    """
+    state = request.GET.get("state")
+    stored_state = request.session.get("gbp_state")
+    next_url = request.session.get("gbp_next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+
+    if not stored_state or state != stored_state:
+        return HttpResponseBadRequest("Invalid OAuth state")
+
+    code = request.GET.get("code")
+    if not code:
+        return HttpResponseBadRequest("Missing authorization code")
+
+    redirect_uri = request.build_absolute_uri("/integrations/google-business-profile/callback/")
+
+    token_data = {
+        "code": code,
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data=token_data,
+        timeout=10,
+    )
+    if token_resp.status_code != 200:
+        return HttpResponseBadRequest("Failed to exchange code for token")
+
+    token_json = token_resp.json()
+    access_token = token_json.get("access_token", "")
+    refresh_token = token_json.get("refresh_token", "")
+    token_type = token_json.get("token_type", "")
+    expires_in = token_json.get("expires_in")
+
+    expires_at = None
+    if isinstance(expires_in, int):
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    if not request.user.is_authenticated:
+        return redirect(settings.FRONTEND_BASE_URL + "/login")
+
+    conn, _created = GoogleBusinessProfileConnection.objects.get_or_create(user=request.user)
+    conn.access_token = access_token
+    if refresh_token:
+        conn.refresh_token = refresh_token
+    conn.token_type = token_type
+    conn.expires_at = expires_at
+    conn.save()
+
+    request.session.pop("gbp_state", None)
+    request.session.pop("gbp_next", None)
+    return redirect(next_url)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
 def ads_status(request: HttpRequest) -> Response:
     """
     Return whether the current user has a Google Ads connection.
@@ -369,6 +475,8 @@ def ads_connect_callback(request: HttpRequest) -> HttpResponse:
 
     conn, _created = GoogleAdsConnection.objects.get_or_create(user=request.user)
     conn.access_token = access_token
+    # Keep refresh token from user auth only; never overwrite with empty (Google often
+    # omits refresh_token on re-auth, so preserve the existing one).
     if refresh_token:
         conn.refresh_token = refresh_token
     conn.token_type = token_type
@@ -383,8 +491,8 @@ def ads_connect_callback(request: HttpRequest) -> HttpResponse:
             ads_config = {
                 "developer_token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
                 "refresh_token": conn.refresh_token,
-                "client_id": settings.GOOGLE_ADS_CLIENT_ID,
-                "client_secret": settings.GOOGLE_ADS_CLIENT_SECRET,
+                "client_id": settings.GOOGLE_CLIENT_ID,
+                "client_secret": settings.GOOGLE_CLIENT_SECRET,
                 "use_proto_plus": True,
             }
             ads_client = GoogleAdsClient.load_from_dict(ads_config)
@@ -589,6 +697,13 @@ def seo_keywords(request: HttpRequest) -> Response:
     access_token = _get_gsc_access_token(request.user)
     results: list[dict] = []
 
+    logger.info(
+        "[SEO keywords] user_id=%s, site_url=%s, has_gsc_token=%s",
+        request.user.id,
+        site_url or "(none)",
+        bool(access_token),
+    )
+
     if site_url and access_token:
         # Current period: last 30 days
         start = today - timedelta(days=30)
@@ -624,14 +739,19 @@ def seo_keywords(request: HttpRequest) -> Response:
 
         ads_ideas = {}
         try:
+            logger.info("[SEO keywords] GSC branch: calling fetch_keyword_ideas_for_user with %s keywords.", len(keywords))
             ads_ideas = fetch_keyword_ideas_for_user(
                 request.user.id,
                 keywords,
                 industry=industry,
                 description=description,
             )
-        except Exception:
-            # If Ads auth is missing or fails, we still return GSC-only data.
+            logger.info("[SEO keywords] GSC branch: got %s ads_ideas.", len(ads_ideas))
+        except Exception as e:
+            logger.exception(
+                "[SEO keywords] GSC branch: fetch_keyword_ideas_for_user failed: %s. Using GSC-only data.",
+                e,
+            )
             ads_ideas = {}
 
         for row in top_rows:
@@ -671,17 +791,48 @@ def seo_keywords(request: HttpRequest) -> Response:
             )
 
     else:
-        # No GSC connection: fall back to any cached Ads ideas for this user.
-        # These provide global-ish volume and competition, but no site-specific ranking.
-        from .models import GoogleAdsKeywordIdea
+        # No GSC connection: use user's Google Ads connection to get
+        # Keyword Planner recommendations from business profile seeds.
+        logger.info("[SEO keywords] No-GSC branch: using Keyword Planner with profile seeds only.")
+        industry = profile.industry if profile and profile.industry else None
+        description = profile.description if profile and profile.description else None
+        if not industry and not description:
+            description = "services"  # fallback seed so API returns recommendations
+            logger.info("[SEO keywords] No-GSC branch: no industry/description, using fallback seed 'services'.")
+        ads_ideas = {}
+        try:
+            ads_ideas = fetch_keyword_ideas_for_user(
+                request.user.id,
+                [],  # no seed keywords; use industry/description only
+                industry=industry,
+                description=description,
+            )
+            logger.info("[SEO keywords] No-GSC branch: got %s ads_ideas.", len(ads_ideas))
+        except Exception as e:
+            logger.exception(
+                "[SEO keywords] No-GSC branch: fetch_keyword_ideas_for_user failed: %s. Returning empty keywords.",
+                e,
+            )
+            ads_ideas = {}
 
-        for idea in GoogleAdsKeywordIdea.objects.filter(user=request.user).order_by(
-            "-avg_monthly_searches",
-        )[:50]:
+        # Build list from recommendations; add intent and impact (competition, bid range).
+        idea_list = list(ads_ideas.values())
+        # Sort by intent (HIGH first) then by avg_monthly_searches descending.
+        def sort_key(idea):
+            intent = classify_intent(idea.keyword)
+            order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+            return (order.get(intent, 1), -(idea.avg_monthly_searches or 0))
+
+        idea_list.sort(key=sort_key)
+        for idea in idea_list[:50]:
             results.append(
                 {
                     "keyword": idea.keyword,
                     "avg_monthly_searches": idea.avg_monthly_searches,
+                    "competition": idea.competition,
+                    "competition_index": idea.competition_index,
+                    "low_top_of_page_bid_micros": idea.low_top_of_page_bid_micros,
+                    "high_top_of_page_bid_micros": idea.high_top_of_page_bid_micros,
                     "intent": classify_intent(idea.keyword),
                     "current_position": None,
                     "position_change": None,
@@ -691,7 +842,59 @@ def seo_keywords(request: HttpRequest) -> Response:
                 },
             )
 
+    logger.info("[SEO keywords] Returning %s keywords for user_id=%s.", len(results), request.user.id)
     return Response({"keywords": results})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def reviews_overview(request: HttpRequest) -> Response:
+    """
+    Return Reviews Agent overview: star rating, total reviews, response rate, requests sent.
+    Uses Google Business Profile when connected; otherwise returns cached snapshot or defaults.
+    """
+    from .gbp_client import fetch_gbp_overview
+
+    connected = GoogleBusinessProfileConnection.objects.filter(user=request.user).exclude(
+        refresh_token=""
+    ).exists()
+
+    if connected:
+        try:
+            data = fetch_gbp_overview(request.user)
+            if data:
+                return Response(data)
+        except Exception as e:
+            logger.exception("[reviews_overview] fetch_gbp_overview failed: %s", e)
+
+    # Fallback: cached snapshot or defaults
+    try:
+        snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
+        return Response({
+            "star_rating": float(snapshot.star_rating or 0),
+            "previous_star_rating": float(snapshot.previous_star_rating or 0),
+            "total_reviews": snapshot.total_reviews or 0,
+            "new_reviews_this_month": snapshot.new_reviews_this_month or 0,
+            "response_rate_pct": float(snapshot.response_rate_pct or 0),
+            "industry_avg_response_pct": float(snapshot.industry_avg_response_pct or 45),
+            "requests_sent": snapshot.requests_sent or 0,
+            "conversion_pct": float(snapshot.conversion_pct or 0),
+        })
+    except ReviewsOverviewSnapshot.DoesNotExist:
+        # Default placeholder so UI can show "Connect Google Business Profile"
+        return Response({
+            "star_rating": 0,
+            "previous_star_rating": 0,
+            "total_reviews": 0,
+            "new_reviews_this_month": 0,
+            "response_rate_pct": 0,
+            "industry_avg_response_pct": 45,
+            "requests_sent": 0,
+            "conversion_pct": 0,
+            "connected": False,
+        })
 
 
 @csrf_exempt
@@ -701,6 +904,15 @@ def seo_keywords(request: HttpRequest) -> Response:
 def seo_chat(request: HttpRequest) -> Response:
     """SEO agent chat endpoint – delegates to OpenAI utils implementation."""
     return openai_utils.seo_chat(request)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def reviews_chat(request: HttpRequest) -> Response:
+    """Reviews agent chat endpoint – same pattern as SEO, different system role and tables."""
+    return openai_utils.reviews_chat(request)
 
 
 @api_view(["GET"])

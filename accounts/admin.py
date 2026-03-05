@@ -3,11 +3,15 @@ from django.contrib import admin
 from .models import (
     BusinessProfile,
     GoogleSearchConsoleConnection,
+    GoogleBusinessProfileConnection,
     GoogleAdsConnection,
     SEOOverviewSnapshot,
+    ReviewsOverviewSnapshot,
     GoogleAdsKeywordIdea,
     AgentConversation,
     AgentMessage,
+    ReviewsConversation,
+    ReviewsMessage,
 )
 
 
@@ -32,9 +36,21 @@ class GoogleSearchConsoleConnectionAdmin(admin.ModelAdmin):
     search_fields = ("user__email", "user__username")
 
 
+@admin.register(GoogleBusinessProfileConnection)
+class GoogleBusinessProfileConnectionAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "created_at", "updated_at")
+    search_fields = ("user__email", "user__username")
+
+
 @admin.register(GoogleAdsConnection)
 class GoogleAdsConnectionAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "created_at", "updated_at")
+    search_fields = ("user__email", "user__username")
+
+
+@admin.register(ReviewsOverviewSnapshot)
+class ReviewsOverviewSnapshotAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "star_rating", "total_reviews", "response_rate_pct", "last_fetched_at")
     search_fields = ("user__email", "user__username")
 
 
@@ -58,6 +74,18 @@ class AgentConversationAdmin(admin.ModelAdmin):
 
 @admin.register(AgentMessage)
 class AgentMessageAdmin(admin.ModelAdmin):
+    list_display = ("id", "conversation", "role", "created_at")
+    search_fields = ("conversation__user__email", "conversation__user__username", "content")
+
+
+@admin.register(ReviewsConversation)
+class ReviewsConversationAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "title", "created_at", "updated_at")
+    search_fields = ("user__email", "user__username", "title")
+
+
+@admin.register(ReviewsMessage)
+class ReviewsMessageAdmin(admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
 

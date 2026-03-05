@@ -44,6 +44,16 @@ urlpatterns = [
         accounts_views.ads_connect_callback,
         name="gads-connect-callback",
     ),
+    path(
+        "integrations/google-business-profile/start/",
+        accounts_views.gbp_connect_start,
+        name="gbp-connect-start",
+    ),
+    path(
+        "integrations/google-business-profile/callback/",
+        accounts_views.gbp_connect_callback,
+        name="gbp-connect-callback",
+    ),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...
@@ -63,12 +73,18 @@ urlpatterns += [
     path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
     # Google Ads integration status
     path("api/integrations/google-ads/status/", accounts_views.ads_status, name="gads-status"),
+    # Google Business Profile integration status (Reviews Agent)
+    path("api/integrations/google-business-profile/status/", accounts_views.gbp_status, name="gbp-status"),
+    # Reviews overview (star rating, total reviews, response rate, etc. — GBP or cached)
+    path("api/reviews/overview/", accounts_views.reviews_overview, name="reviews-overview"),
     # SEO overview metrics for dashboard (Google Search Console powered)
     path("api/seo/overview/", accounts_views.seo_overview, name="seo-overview"),
     # High-Intent Keywords dataset for SEO agent
     path("api/seo/keywords/", accounts_views.seo_keywords, name="seo-keywords"),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
+    # Reviews agent chat (separate tables, different system role)
+    path("api/reviews/chat/", accounts_views.reviews_chat, name="reviews-chat"),
     # API logout to clear Django/Google SSO session
     path("api/logout/", accounts_views.api_logout, name="api-logout"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),

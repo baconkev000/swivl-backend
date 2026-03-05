@@ -70,6 +70,34 @@ class GoogleSearchConsoleConnection(models.Model):
         return f"GSCConnection(user={self.user!s})"
 
 
+class GoogleBusinessProfileConnection(models.Model):
+    """
+    Tracks whether a user has granted this app access to Google Business Profile (reviews, locations).
+    Used by the Reviews Agent to pull star rating, total reviews, and response rate.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="gbp_connection",
+    )
+
+    access_token = models.TextField(blank=True)
+    refresh_token = models.TextField(blank=True)
+    token_type = models.CharField(max_length=32, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Google Business Profile connection"
+        verbose_name_plural = "Google Business Profile connections"
+
+    def __str__(self) -> str:
+        return f"GBPConnection(user={self.user!s})"
+
+
 class GoogleAdsConnection(models.Model):
     """
     Tracks whether a user has granted this app access to their Google Ads account.
@@ -128,6 +156,36 @@ class SEOOverviewSnapshot(models.Model):
 
     def __str__(self) -> str:
         return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
+
+
+class ReviewsOverviewSnapshot(models.Model):
+    """
+    Cached reviews/GBP overview metrics per user (star rating, total reviews, response rate, etc.).
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="reviews_overview_snapshot",
+    )
+
+    star_rating = models.DecimalField(max_digits=3, decimal_places=2, default=0, null=True, blank=True)
+    previous_star_rating = models.DecimalField(max_digits=3, decimal_places=2, default=0, null=True, blank=True)
+    total_reviews = models.IntegerField(default=0)
+    new_reviews_this_month = models.IntegerField(default=0)
+    response_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0, null=True, blank=True)
+    industry_avg_response_pct = models.DecimalField(max_digits=5, decimal_places=2, default=45, null=True, blank=True)
+    requests_sent = models.IntegerField(default=0)
+    conversion_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0, null=True, blank=True)
+
+    last_fetched_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Reviews overview snapshot"
+        verbose_name_plural = "Reviews overview snapshots"
+
+    def __str__(self) -> str:
+        return f"ReviewsOverviewSnapshot(user={self.user!s})"
 
 
 class GoogleAdsKeywordIdea(models.Model):
@@ -212,6 +270,58 @@ class AgentMessage(models.Model):
 
     def __str__(self) -> str:
         return f"AgentMessage(conv={self.conversation_id}, role={self.role})"
+
+
+class ReviewsConversation(models.Model):
+    """
+    Conversation thread for the Reviews Agent chat. Kept separate from SEO/Ads.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="reviews_conversations",
+    )
+    title = models.CharField(max_length=255, blank=True)
+    summary = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        verbose_name = "Reviews conversation"
+        verbose_name_plural = "Reviews conversations"
+
+    def __str__(self) -> str:
+        return f"ReviewsConversation(user={self.user!s}, id={self.id})"
+
+
+class ReviewsMessage(models.Model):
+    """
+    Individual message within a Reviews Agent conversation.
+    """
+
+    ROLE_CHOICES = [
+        ("user", "User"),
+        ("assistant", "Assistant"),
+    ]
+
+    conversation = models.ForeignKey(
+        ReviewsConversation,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES)
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        verbose_name = "Reviews message"
+        verbose_name_plural = "Reviews messages"
+
+    def __str__(self) -> str:
+        return f"ReviewsMessage(conv={self.conversation_id}, role={self.role})"
 
 
 

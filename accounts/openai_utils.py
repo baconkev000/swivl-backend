@@ -12,7 +12,13 @@ from django.http import HttpRequest
 from openai import OpenAI
 from rest_framework.response import Response
 
-from .models import AgentConversation, AgentMessage, BusinessProfile
+from .models import (
+    AgentConversation,
+    AgentMessage,
+    BusinessProfile,
+    ReviewsConversation,
+    ReviewsMessage,
+)
 
 
 def build_seo_system_prompt(user, profile: BusinessProfile | None) -> str:
@@ -37,17 +43,48 @@ def build_seo_system_prompt(user, profile: BusinessProfile | None) -> str:
     return base
 
 
-def _get_client() -> OpenAI:
+def build_reviews_system_prompt(user, profile: BusinessProfile | None) -> str:
     """
-    Return an OpenAI client, preferring the SEO-specific key if set.
+    Build the system prompt for the Reviews Agent (trust, reputation, review response).
+    Different role from SEO; same structure (optionally use business profile context).
+    """
+    base = (
+        "You are an expert Reviews and Reputation agent that helps a small business "
+        "build trust, respond to reviews, and turn feedback into marketing leverage. "
+        "You focus on: responding to reviews in a brand-aligned way, identifying praise themes "
+        "for ad copy, flagging recurring complaints, and improving close rate through trust. "
+        "You speak plainly and are specific and actionable. "
+        "Never argue with reviewers; never sound robotic."
+    )
+    if profile:
+        details: list[str] = []
+        if profile.business_name:
+            details.append(f"Business name: {profile.business_name}.")
+        if profile.industry:
+            details.append(f"Industry: {profile.industry}.")
+        if profile.tone_of_voice:
+            details.append(f"Tone of voice: {profile.tone_of_voice}.")
+        if profile.description:
+            details.append(f"Business description: {profile.description}.")
+        if details:
+            base += " Here is context about the business: " + " ".join(details)
+    return base
 
-    - If OPEN_AI_SEO_API_KEY is set in the environment, use that.
-    - Otherwise, fall back to OPENAI_API_KEY (the library default).
+
+def _get_client(api_key_env: str | None = None) -> OpenAI:
     """
-    api_key = os.getenv("OPEN_AI_SEO_API_KEY") or os.getenv("OPENAI_API_KEY")
+    Return an OpenAI client using the given env var for the API key.
+
+    - If api_key_env is set (e.g. OPEN_AI_SEO_API_KEY, OPEN_AI_REVIEWS_API_KEY),
+      use that env var, then fall back to OPENAI_API_KEY.
+    - Otherwise use OPENAI_API_KEY.
+    """
+    if api_key_env:
+        api_key = os.getenv(api_key_env) or os.getenv("OPENAI_API_KEY")
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
         return OpenAI(api_key=api_key)
-    # Fall back to default constructor (will raise a clear error if no key is configured)
     return OpenAI()
 
 
@@ -55,16 +92,16 @@ def _get_model() -> str:
     return getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
 
 
-def get_seo_chat_reply(
+def _get_chat_reply(
     system_prompt: str,
-    recent_messages: list[AgentMessage],
+    recent_messages: list,
     conversation_summary: str | None = None,
+    api_key_env: str | None = None,
 ) -> str:
     """
-    Call OpenAI chat completion for the SEO agent.
-
-    Builds messages from system_prompt, optional conversation_summary, and
-    recent_messages (role + content). Returns the assistant reply text.
+    Call OpenAI chat completion. recent_messages must have .role and .content.
+    api_key_env: env var for API key (e.g. OPEN_AI_SEO_API_KEY, OPEN_AI_REVIEWS_API_KEY).
+    Returns the assistant reply text.
     """
     openai_messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -81,13 +118,27 @@ def get_seo_chat_reply(
             {"role": msg.role, "content": msg.content},
         )
 
-    client = _get_client()
+    client = _get_client(api_key_env)
     model = _get_model()
     completion = client.chat.completions.create(
         model=model,
         messages=openai_messages,
     )
     return (completion.choices[0].message.content or "").strip()
+
+
+def get_seo_chat_reply(
+    system_prompt: str,
+    recent_messages: list[AgentMessage],
+    conversation_summary: str | None = None,
+) -> str:
+    """Call OpenAI for SEO agent using OPEN_AI_SEO_API_KEY."""
+    return _get_chat_reply(
+        system_prompt,
+        recent_messages,
+        conversation_summary,
+        api_key_env="OPEN_AI_SEO_API_KEY",
+    )
 
 
 def summarize_seo_conversation(messages: list[AgentMessage]) -> str:
@@ -106,7 +157,32 @@ def summarize_seo_conversation(messages: list[AgentMessage]) -> str:
     for m in messages:
         payload.append({"role": m.role, "content": m.content})
 
-    client = _get_client()
+    client = _get_client("OPEN_AI_SEO_API_KEY")
+    model = _get_model()
+    completion = client.chat.completions.create(
+        model=model,
+        messages=payload,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
+    """
+    Ask OpenAI to summarize a Reviews conversation into concise memory notes.
+    """
+    payload: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "Summarize the following Reviews/Reputation conversation into concise memory notes. "
+                "Capture key goals, tone preferences, and decisions. 5-10 bullet points max."
+            ),
+        },
+    ]
+    for m in messages:
+        payload.append({"role": m.role, "content": m.content})
+
+    client = _get_client("OPEN_AI_REVIEWS_API_KEY")
     model = _get_model()
     completion = client.chat.completions.create(
         model=model,
@@ -182,6 +258,76 @@ def seo_chat(request: HttpRequest) -> Response:
             conversation.messages.order_by("created_at")[:80],
         )
         conversation.summary = summarize_seo_conversation(summary_messages)
+        conversation.save(update_fields=["summary", "updated_at"])
+
+    return Response(
+        {
+            "conversation_id": conversation.id,
+            "reply": assistant_reply,
+        },
+    )
+
+
+def reviews_chat(request: HttpRequest) -> Response:
+    """
+    Core implementation of the Reviews Agent chat endpoint. Same pattern as SEO chat
+    but uses ReviewsConversation and ReviewsMessage (separate tables) and a different system role.
+    """
+    data = request.data
+    message = (data.get("message") or "").strip()
+    if not message:
+        return Response({"detail": "Message is required."}, status=400)
+
+    conversation_id = data.get("conversation_id")
+
+    conversation: ReviewsConversation | None = None
+    if conversation_id:
+        try:
+            conversation = ReviewsConversation.objects.get(
+                id=conversation_id,
+                user=request.user,
+            )
+        except ReviewsConversation.DoesNotExist:
+            conversation = None
+
+    if not conversation:
+        conversation = ReviewsConversation.objects.create(
+            user=request.user,
+            title="Reviews Agent Chat",
+        )
+
+    ReviewsMessage.objects.create(
+        conversation=conversation,
+        role="user",
+        content=message,
+    )
+
+    recent_messages = list(
+        conversation.messages.order_by("-created_at")[:20],
+    )
+    recent_messages.reverse()
+
+    profile = BusinessProfile.objects.filter(user=request.user).first()
+    system_prompt = build_reviews_system_prompt(request.user, profile)
+    assistant_reply = _get_chat_reply(
+        system_prompt,
+        recent_messages,
+        conversation_summary=conversation.summary or None,
+        api_key_env="OPEN_AI_REVIEWS_API_KEY",
+    )
+
+    ReviewsMessage.objects.create(
+        conversation=conversation,
+        role="assistant",
+        content=assistant_reply,
+    )
+
+    total_messages = conversation.messages.count()
+    if total_messages > 40:
+        summary_messages = list(
+            conversation.messages.order_by("created_at")[:80],
+        )
+        conversation.summary = summarize_reviews_conversation(summary_messages)
         conversation.save(update_fields=["summary", "updated_at"])
 
     return Response(
