@@ -61,8 +61,16 @@ COPY --chown=django:django ./compose/production/django/start /start
 RUN sed -i 's/\r$//g' /start
 RUN chmod +x /start
 
-# Copy the application from the builder
-COPY --from=python-build-stage --chown=django:django ${APP_HOME} ${APP_HOME}
+# Copy from builder in separate layers for better cache reuse.
+# .venv changes only when deps change (large layer, caches well).
+COPY --from=python-build-stage --chown=django:django /app/.venv /app/.venv
+# App code (smaller layers, invalidated on code changes).
+COPY --from=python-build-stage --chown=django:django /app/config /app/config
+COPY --from=python-build-stage --chown=django:django /app/swivl /app/swivl
+COPY --from=python-build-stage --chown=django:django /app/accounts /app/accounts
+COPY --from=python-build-stage --chown=django:django /app/manage.py /app/manage.py
+COPY --from=python-build-stage --chown=django:django /app/locale /app/locale
+COPY --from=python-build-stage --chown=django:django /app/pyproject.toml /app/pyproject.toml
 
 # make django owner of the WORKDIR directory as well.
 RUN chown django:django ${APP_HOME}
