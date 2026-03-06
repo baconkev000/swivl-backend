@@ -46,12 +46,3 @@ services:
   redis:
     image: docker.io/redis:7.2
     
-
-  awscli:
-    build:
-      context: .
-      dockerfile: ./compose/production/aws/Dockerfile
-    env_file:
-      - /home/deploy/app/swivl-backend/.env
-    volumes:
-      - production_postgres_data_backups:/backups:z
