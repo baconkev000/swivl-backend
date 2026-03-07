@@ -8,6 +8,9 @@ from .base import env
 
 # GENERAL
 # ------------------------------------------------------------------------------
+# Debug log path: writable in Docker (/app is owned by django user)
+import os
+DEBUG_LOG_PATH = os.environ.get("DEBUG_LOG_PATH", str(BASE_DIR / "debug-e47e3c.log"))
 # https://docs.djangoproject.com/en/dev/ref/settings/#secret-key
 SECRET_KEY = env("DJANGO_SECRET_KEY")
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
@@ -160,7 +163,7 @@ LOGGING = {
     "root": {"level": "INFO", "handlers": ["console"]},
     "loggers": {
         "django.request": {
-            "handlers": ["mail_admins"],
+            "handlers": ["console", "mail_admins"],
             "level": "ERROR",
             "propagate": True,
         },
