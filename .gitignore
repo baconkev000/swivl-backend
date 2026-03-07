@@ -277,3 +277,4 @@ swivl/media/
 !.envs/.local/
 .venv
 .envs
+sample.env
